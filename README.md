@@ -64,6 +64,9 @@ async fn main() {
     let bot_ctx = BotContextBuilder::new()
         // 声明链接地址
         .url("ws://localhost:3001")
+        // 可选：连接上游时发送 Bearer token；不调用时不发送 Authorization 头。
+        // 生产环境建议从环境变量读取，不要硬编码真实 token。
+        // .access_token(std::env::var("RUNBOT_ACCESS_TOKEN").unwrap())
         // 注册事件处理器 (方法名的UPPER_SNAKE)
         .add_processor(DEMO_PROCESSOR_FN)
         .build()
@@ -72,6 +75,10 @@ async fn main() {
     loop_client(bot_ctx).await;
 }
 ```
+
+配置 `access_token` 后，`loop_client` 会在每次连接/重连的 WebSocket 握手请求中发送 `Authorization: Bearer <token>`，不会把 token 放入 URL。上游 OneBot 服务端需配置相同的 access token；未配置时保持原有的无认证连接行为。握手被拒绝时会按既有逻辑等待后重连。
+
+注意：明文 `ws://` 下 token 可能被网络监听者截获，生产环境应使用 `wss://` 或受信任的 TLS 终止代理。
 
 ![hello](images/hello.png)
 

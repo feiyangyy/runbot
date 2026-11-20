@@ -16,7 +16,6 @@ use tokio::time::Duration;
 use tokio_tungstenite::WebSocketStream;
 
 // todo: default time for bot context
-#[derive(Debug)]
 pub struct BotContext {
     pub(crate) connection: Mutex<Option<BotConnection>>,
     pub url: Option<String>,
@@ -25,6 +24,25 @@ pub struct BotContext {
     pub echo_notifer: Arc<DashMap<String, tokio::sync::mpsc::Sender<Response>>>,
     pub(crate) shutdown_tx: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub(crate) shutdown_rx: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    pub(crate) access_token: Option<String>,
+}
+
+impl Debug for BotContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotContext")
+            .field("connection", &self.connection)
+            .field("url", &self.url)
+            .field("id", &self.id)
+            .field("processors", &self.processors)
+            .field("echo_notifer", &self.echo_notifer)
+            .field("shutdown_tx", &self.shutdown_tx)
+            .field("shutdown_rx", &self.shutdown_rx)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -227,6 +245,7 @@ impl fmt::Debug for BotConnection {
 pub struct BotContextBuilder {
     pub url: Option<String>,
     pub processors: Vec<Processor>,
+    access_token: Option<String>,
 }
 
 impl BotContextBuilder {
@@ -234,6 +253,7 @@ impl BotContextBuilder {
         Self {
             url: None,
             processors: vec![],
+            access_token: None,
         }
     }
 
@@ -242,6 +262,15 @@ impl BotContextBuilder {
             url: Some(url.into()),
             ..self
         }
+    }
+
+    /// 设置连接正向 WebSocket 上游时发送的 Bearer token。
+    ///
+    /// 未调用此方法时不发送 `Authorization` 头，保持无认证连接行为。
+    /// token 只用于握手请求，不会被记入日志或 Debug 输出。
+    pub fn access_token(mut self, token: impl Into<String>) -> Self {
+        self.access_token = Some(token.into());
+        self
     }
 
     pub fn add_processor(
@@ -253,6 +282,11 @@ impl BotContextBuilder {
     }
 
     pub fn build(self) -> Result<Arc<BotContext>> {
+        if self.access_token.as_deref() == Some("") {
+            return Err(Error::ParamsError(
+                "access_token must not be empty".to_string(),
+            ));
+        }
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Ok(Arc::new(BotContext {
             connection: Mutex::new(None),
@@ -262,6 +296,7 @@ impl BotContextBuilder {
             echo_notifer: Arc::new(DashMap::new()),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             shutdown_rx: Mutex::new(Some(shutdown_rx)),
+            access_token: self.access_token,
         }))
     }
 }
@@ -375,5 +410,153 @@ mod tests {
         let output = format!("{server:?}");
         assert!(!output.contains("secret-token"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_context_builder_stores_access_token() {
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .access_token("secret-token")
+            .build()
+            .unwrap();
+        assert_eq!(bot_ctx.access_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn test_context_builder_rejects_empty_access_token() {
+        let result = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .access_token("")
+            .build();
+        assert!(
+            matches!(result, Err(Error::ParamsError(message)) if message.contains("access_token"))
+        );
+    }
+
+    #[test]
+    fn test_context_debug_redacts_access_token() {
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .access_token("secret-token")
+            .build()
+            .unwrap();
+        let output = format!("{bot_ctx:?}");
+        assert!(!output.contains("secret-token"));
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_builders_default_to_no_access_token() {
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .build()
+            .unwrap();
+        assert!(server.access_token.is_none());
+
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .build()
+            .unwrap();
+        assert!(bot_ctx.access_token.is_none());
+    }
+
+    #[test]
+    fn test_builders_store_owned_and_borrowed_tokens_exactly() {
+        let owned = String::from("Case-Sensitive_Token-2026");
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .access_token(owned.clone())
+            .build()
+            .unwrap();
+        assert_eq!(server.access_token.as_deref(), Some(owned.as_str()));
+
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .access_token("  token with spaces  ")
+            .build()
+            .unwrap();
+        assert_eq!(
+            bot_ctx.access_token.as_deref(),
+            Some("  token with spaces  ")
+        );
+    }
+
+    #[test]
+    fn test_builders_use_last_configured_token() {
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .access_token("token-A")
+            .access_token("token-B")
+            .build()
+            .unwrap();
+        assert_eq!(server.access_token.as_deref(), Some("token-B"));
+
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .access_token(String::from("token-A"))
+            .access_token("token-B")
+            .build()
+            .unwrap();
+        assert_eq!(bot_ctx.access_token.as_deref(), Some("token-B"));
+    }
+
+    #[test]
+    fn test_server_builder_requires_bind() {
+        let result = BotServerBuilder::new().access_token("token-A").build();
+        assert!(matches!(result, Err(Error::ParamsError(message)) if message.contains("bind")));
+    }
+
+    #[tokio::test]
+    async fn test_client_build_without_url_then_loop_client_returns_params_error() {
+        let bot_ctx = BotContextBuilder::new()
+            .access_token("token-A")
+            .build()
+            .unwrap();
+        assert!(bot_ctx.url.is_none());
+
+        let result = crate::connection::loop_client(bot_ctx).await;
+        assert!(matches!(result, Err(Error::ParamsError(message)) if message.contains("url")));
+    }
+
+    #[test]
+    fn test_debug_without_token_does_not_fake_credentials() {
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .build()
+            .unwrap();
+        let server_debug = format!("{server:?}");
+        assert!(server_debug.contains("127.0.0.1:3131"));
+        assert!(!server_debug.contains("[REDACTED]"));
+        assert!(!server_debug.contains("Bearer"));
+
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .build()
+            .unwrap();
+        let context_debug = format!("{bot_ctx:?}");
+        assert!(context_debug.contains("ws://127.0.0.1:3131"));
+        assert!(!context_debug.contains("[REDACTED]"));
+        assert!(!context_debug.contains("Bearer"));
+    }
+
+    #[test]
+    fn test_expanded_debug_redacts_tokens() {
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .access_token("server-secret-token")
+            .build()
+            .unwrap();
+        let server_debug = format!("{server:#?}");
+        assert!(!server_debug.contains("server-secret-token"));
+        assert!(server_debug.contains("[REDACTED]"));
+
+        let bot_ctx = BotContextBuilder::new()
+            .url("ws://127.0.0.1:3131")
+            .access_token("client-secret-token")
+            .build()
+            .unwrap();
+        let context_debug = format!("{bot_ctx:#?}");
+        assert!(!context_debug.contains("client-secret-token"));
+        assert!(context_debug.contains("[REDACTED]"));
     }
 }

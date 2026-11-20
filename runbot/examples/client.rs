@@ -7,8 +7,15 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
-    let bot_ctx = BotContextBuilder::new()
-        .url("ws://localhost:3001")
+    let mut builder = BotContextBuilder::new().url("ws://localhost:3001");
+    // 可选：从环境变量读取上游 access token，未设置时不发送 Authorization 头。
+    // 不要在源码中硬编码真实 token。
+    if let Ok(token) = std::env::var("RUNBOT_ACCESS_TOKEN") {
+        if !token.is_empty() {
+            builder = builder.access_token(token);
+        }
+    }
+    let bot_ctx = builder
         .add_processor(DEMO_MESSAGE_PROCESSOR_FN)
         .add_processor(DEMO_NOTICE_PROCESSOR_FN)
         .add_processor(DEMO_AUTO_APPROVE_FN)
@@ -352,7 +359,7 @@ mod tests {
         // 使用 timeout 确保不会无限等待
         let result = timeout(Duration::from_secs(2), loop_handle).await;
         assert!(result.is_ok(), "loop_client should exit after shutdown");
-        
+
         // 检查 loop_client 是否正常退出（返回 Ok）
         let loop_result = result.unwrap();
         assert!(loop_result.is_ok(), "loop_client should return Ok after shutdown");
