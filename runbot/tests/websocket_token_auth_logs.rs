@@ -48,8 +48,9 @@ fn assert_no_credentials(logs: &str) {
 async fn test_s01_s02_s03_s04_logs_errors_and_responses_do_not_leak_credentials() {
     let logger = LogBuffer::default();
     let writer = logger.clone();
-    // 只采集 INFO 及以上日志：tungstenite 的 TRACE 会打印握手原文，
-    // 其中包含 Authorization 头，生产环境也不应开启该第三方 TRACE。
+    // Capture INFO and above only: tungstenite TRACE logs print the raw handshake request,
+    // including the Authorization header. That third-party TRACE should not be enabled in
+    // production either.
     tracing_subscriber::fmt()
         .with_writer(move || writer.clone())
         .with_ansi(false)

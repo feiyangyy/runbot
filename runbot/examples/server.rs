@@ -8,8 +8,9 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .init();
     let mut builder = BotServerBuilder::new().bind("0.0.0.0:3131");
-    // 可选：从环境变量读取入站 token，未设置时保持无认证连接。
-    // 不要在源码中硬编码真实 token。
+    // Optional: read the inbound token from an environment variable. When it is not set,
+    // connections remain unauthenticated.
+    // Do not hard-code real tokens in source code.
     if let Ok(token) = std::env::var("RUNBOT_ACCESS_TOKEN") {
         if !token.is_empty() {
             builder = builder.access_token(token);

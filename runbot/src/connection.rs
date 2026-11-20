@@ -1,3 +1,10 @@
+//! Forward and reverse WebSocket connection loops.
+//!
+//! [`loop_client`] connects to the configured upstream and handles reconnection;
+//! [`loop_server`] binds an address, accepts inbound connections, and validates
+//! `Authorization: Bearer` during the handshake when an access token is configured. Both
+//! functions are long-running futures and have no "startup complete, then return" phase.
+
 use std::sync::Arc;
 
 use crate::bot_context::*;
@@ -41,7 +48,8 @@ impl AuthFailure {
     }
 }
 
-/// 常量时间比较，避免根据逐字节比较结果产生明显的时序差异。
+/// Compares two byte slices in constant time to avoid timing differences that depend on
+/// the first mismatching byte.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max_len = a.len().max(b.len());
     let mut diff = a.len() ^ b.len();
@@ -149,13 +157,13 @@ async fn loop_bot<S>(bot_ctx: Arc<BotContext>, ws_stream: WebSocketStream<S>)
 where
     S: AsyncRead + AsyncWrite + Sync + Send + Unpin + 'static,
 {
-    // 检查是否已经 shutdown
+    // Check whether shutdown has already been requested.
     if bot_ctx.is_shutdown() {
         tracing::warn!("Bot is already shutdown, skipping loop_bot");
         return;
     }
 
-    // 获取 shutdown receiver
+    // Obtain the shutdown receiver.
     let mut shutdown_rx = {
         let rx_lock = bot_ctx.shutdown_rx.lock().await;
         rx_lock.as_ref().cloned()
@@ -168,7 +176,7 @@ where
     bot_ctx.set_connection(connection).await;
 
     loop {
-        // 使用 select! 来同时等待消息和 shutdown 信号
+        // Wait for a message and the shutdown signal concurrently.
         let shutdown_fut = async {
             if let Some(ref mut rx) = shutdown_rx {
                 rx.changed().await.ok();
@@ -198,7 +206,7 @@ where
                     }
                     Some(Err(e)) => {
                         tracing::error!("WS error: {:?}", e);
-                        break; // 断开则退出内层循环，重连
+                        break; // Exit the inner loop on disconnect and reconnect.
                     }
                     None => {
                         tracing::info!("WebSocket stream ended");
@@ -211,8 +219,45 @@ where
     bot_ctx.set_connection(None).await;
 }
 
+/// Binds the configured address and continuously accepts reverse WebSocket connections.
+///
+/// This function runs the accept loop; it does not return immediately after startup.
+/// After a successful bind, each TCP connection is handled by a separate task that
+/// completes the WebSocket handshake. When an access token is configured, only requests
+/// carrying a matching `Authorization: Bearer` value are accepted. A failed handshake
+/// returns 401 or a protocol error and ends that connection without creating a
+/// [`BotContext`], and the accept loop continues serving other connections.
+///
+/// A connection that completes the handshake gets its own context and message loop. The
+/// processor list in `BotServer` is shared by all connections, but the connection, response
+/// registry, and shutdown signal are independent per connection.
+///
+/// # Errors
+///
+/// Returns [`Error::StateError`] when the address cannot be bound. Runtime accept errors are
+/// logged and retried after 100 milliseconds; they do not end this function through its
+/// return value. A normally running call never returns.
+///
+/// # Cancellation
+///
+/// Cancelling the future ends the accept loop, but connection tasks already spawned are not
+/// cancelled or awaited. This function does not provide an overall graceful shutdown API.
+///
+/// # Examples
+///
+/// ```no_run
+/// use runbot::prelude::*;
+///
+/// # async fn run() -> runbot::error::Result<()> {
+/// let server = BotServerBuilder::new()
+///     .bind("0.0.0.0:3131")
+///     .build()?;
+/// loop_server(server).await
+/// # }
+/// # fn main() {}
+/// ```
 pub async fn loop_server(bot_server: Arc<BotServer>) -> Result<()> {
-    // 监听本地端口
+    // Bind the local port.
     let listener = TcpListener::bind(&bot_server.bind)
         .await
         .map_err(|err| Error::StateError(format!("bind {} failed: {err}", bot_server.bind)))?;
@@ -228,7 +273,7 @@ pub async fn loop_server(bot_server: Arc<BotServer>) -> Result<()> {
         };
         let bot_server = bot_server.clone();
         tokio::spawn(async move {
-            // 先完成握手阶段的认证，失败时不创建 BotContext。
+            // Complete handshake authentication first; do not create a BotContext on failure.
             let ws_stream = match accept_websocket(stream, bot_server.access_token.clone()).await {
                 Ok(ws_stream) => ws_stream,
                 Err(err) => {
@@ -256,8 +301,54 @@ pub async fn loop_server(bot_server: Arc<BotServer>) -> Result<()> {
     }
 }
 
+/// Connects to the configured forward WebSocket upstream and reconnects after disconnects.
+///
+/// This function runs the connection loop; it does not return immediately after a
+/// connection is established. Every attempt builds a handshake request from
+/// [`BotContextBuilder::access_token`]: when a token is configured it sends
+/// `Authorization: Bearer <token>`; otherwise the header is omitted. After connecting, it
+/// processes events until the connection closes or [`BotContext::shutdown`] is signalled.
+///
+/// Rejected handshakes, connection failures, and disconnects are logged and retried after
+/// 15 seconds. If the shutdown signal arrives during the wait, the loop exits immediately.
+/// Configuration errors return directly without entering the reconnect loop. Before a
+/// connection is established, API methods that send requests return
+/// [`Error::StateError`], so callers should issue business requests only after the
+/// connection is ready.
+///
+/// # Errors
+///
+/// - Returns [`Error::StateError`] when the context has already been shut down.
+/// - Returns [`Error::ParamsError`] when [`BotContextBuilder::url`] is not set.
+/// - Returns [`Error::WebSocketError`] when the URL cannot be used to build a request.
+/// - Returns [`Error::ParamsError`] when the access token is empty or contains characters
+///   that cannot form an HTTP header.
+/// - Returns `Ok(())` after a normal shutdown signal.
+///
+/// Recoverable connection failures are not reported immediately through the return value;
+/// they are logged and retried.
+///
+/// # Cancellation
+///
+/// Cancelling the future stops the connect/reconnect loop and drops the current local
+/// connection; requests already sent to the remote side are not cancelled. Tasks spawned by
+/// processors are not guaranteed to finish when this function ends.
+///
+/// # Examples
+///
+/// ```no_run
+/// use runbot::prelude::*;
+///
+/// # async fn run() -> runbot::error::Result<()> {
+/// let bot_ctx = BotContextBuilder::new()
+///     .url("ws://127.0.0.1:3001")
+///     .build()?;
+/// loop_client(bot_ctx).await
+/// # }
+/// # fn main() {}
+/// ```
 pub async fn loop_client(bot_ctx: Arc<BotContext>) -> Result<()> {
-    // 检查是否已经 shutdown
+    // Check whether shutdown has already been requested.
     if bot_ctx.is_shutdown() {
         return Err(Error::StateError(
             "Bot is already shutdown, cannot start loop_client".to_string(),
@@ -272,20 +363,20 @@ pub async fn loop_client(bot_ctx: Arc<BotContext>) -> Result<()> {
         ))
         .map(|e| e.clone())?;
 
-    // 获取 shutdown receiver
+    // Obtain the shutdown receiver.
     let mut shutdown_rx = {
         let rx_lock = bot_ctx.shutdown_rx.lock().await;
         rx_lock.as_ref().cloned()
     };
 
     loop {
-        // 检查 shutdown 信号
+        // Check the shutdown signal.
         if bot_ctx.is_shutdown() {
             tracing::info!("Shutdown signal received, exiting loop_client");
             return Ok(());
         }
 
-        // 使用 select! 来同时等待连接和 shutdown 信号
+        // Wait for a connection and the shutdown signal concurrently.
         let shutdown_fut = async {
             if let Some(ref mut rx) = shutdown_rx {
                 rx.changed().await.ok();
@@ -320,20 +411,21 @@ pub async fn loop_client(bot_ctx: Arc<BotContext>) -> Result<()> {
                         tracing::info!("WS {} Connected!", &url);
                         let _ = loop_bot(bot_ctx.clone(), ws_stream).await;
                     }
-                    // 只使用 Display 输出错误；Http 错误的 Debug 会包含响应头/正文，
-                    // 上游若反射 Authorization，使用 Debug 可能把凭据写进日志。
+                    // Use Display only: the Debug form of an HTTP error contains response
+                    // headers and body. If the upstream reflects Authorization, Debug could
+                    // write credentials into the logs.
                     Err(e) => tracing::error!("WS {} connect error: {}", &url, e),
                 }
             }
         }
 
-        // 检查 shutdown 信号，如果已 shutdown 则不重连
+        // Check the shutdown signal; do not reconnect after shutdown.
         if bot_ctx.is_shutdown() {
             tracing::info!("Shutdown signal received, exiting loop_client");
             return Ok(());
         }
 
-        // 使用 select! 来同时等待 sleep 和 shutdown 信号
+        // Wait for the reconnect delay and the shutdown signal concurrently.
         let shutdown_fut = async {
             if let Some(ref mut rx) = shutdown_rx {
                 rx.changed().await.ok();
@@ -752,7 +844,7 @@ mod tests {
             .and_then(|status| status.parse().ok())
             .expect("handshake response should contain a status code");
 
-        // 握手阶段已经结束，服务端 task 不应再等待连接上的数据。
+        // The handshake is complete; the server task should not wait for more connection data.
         let _ = server_task.await.unwrap();
         status
     }
