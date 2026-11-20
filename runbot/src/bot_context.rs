@@ -269,11 +269,26 @@ impl BotContextBuilder {
 pub struct BotServer {
     pub bind: String,
     pub processors: Arc<Vec<Processor>>,
+    pub(crate) access_token: Option<String>,
+}
+
+impl Debug for BotServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotServer")
+            .field("bind", &self.bind)
+            .field("processors", &self.processors)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 pub struct BotServerBuilder {
     pub bind: Option<String>,
     pub processors: Vec<Processor>,
+    access_token: Option<String>,
 }
 
 impl BotServerBuilder {
@@ -281,11 +296,21 @@ impl BotServerBuilder {
         Self {
             bind: None,
             processors: vec![],
+            access_token: None,
         }
     }
 
     pub fn bind(mut self, bind: impl Into<String>) -> Self {
         self.bind = Some(bind.into());
+        self
+    }
+
+    /// 设置反向 WebSocket 握手要求的 Bearer token。
+    ///
+    /// 未调用此方法时不校验 `Authorization` 头，保持无认证连接行为。
+    /// token 只用于握手校验，不会被记入日志或 Debug 输出。
+    pub fn access_token(mut self, token: impl Into<String>) -> Self {
+        self.access_token = Some(token.into());
         self
     }
 
@@ -298,6 +323,11 @@ impl BotServerBuilder {
     }
 
     pub fn build(self) -> Result<Arc<BotServer>> {
+        if self.access_token.as_deref() == Some("") {
+            return Err(Error::ParamsError(
+                "access_token must not be empty".to_string(),
+            ));
+        }
         Ok(Arc::new(BotServer {
             bind: if let Some(bind) = self.bind {
                 bind
@@ -305,6 +335,45 @@ impl BotServerBuilder {
                 return Err(Error::ParamsError("bind must be set".to_string()));
             },
             processors: Arc::new(self.processors),
+            access_token: self.access_token,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_builder_stores_access_token() {
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .access_token("secret-token")
+            .build()
+            .unwrap();
+        assert_eq!(server.access_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn test_server_builder_rejects_empty_access_token() {
+        let result = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .access_token("")
+            .build();
+        assert!(
+            matches!(result, Err(Error::ParamsError(message)) if message.contains("access_token"))
+        );
+    }
+
+    #[test]
+    fn test_server_debug_redacts_access_token() {
+        let server = BotServerBuilder::new()
+            .bind("127.0.0.1:3131")
+            .access_token("secret-token")
+            .build()
+            .unwrap();
+        let output = format!("{server:?}");
+        assert!(!output.contains("secret-token"));
+        assert!(output.contains("[REDACTED]"));
     }
 }

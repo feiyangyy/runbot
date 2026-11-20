@@ -122,12 +122,19 @@ async fn main() {
         .init();
     let server = BotServerBuilder::new()
         .bind("0.0.0.0:3131")
-        .add_message_processor(DEMO_PROCESSOR_FN)
+        // 可选：启用入站 token 认证；不调用时保持无认证连接。
+        // 生产环境建议从环境变量读取，不要硬编码真实 token。
+        // .access_token(std::env::var("RUNBOT_ACCESS_TOKEN").unwrap())
+        .add_processor(DEMO_PROCESSOR_FN)
         .build()
         .unwrap();
     loop_server(server).await.unwrap();
 }
 ```
+
+启用 `access_token` 后，OneBot 客户端需配置相同的 access token，并在反向 WS 握手中发送 `Authorization: Bearer <token>`。缺失、格式错误或不匹配的凭据会在 WebSocket 升级前被拒绝并返回 401，不会创建连接上下文；未配置 token 时仍保持原有的开放连接行为。
+
+注意：明文 `ws://` 下 token 可能被网络监听者截获，生产环境应使用 `wss://` 或受信任的 TLS 终止代理。
 
 #### 机器人命令
 
